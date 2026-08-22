@@ -19,6 +19,9 @@ Item {
     property var allItems: []
     property var items: []
     property bool itemsLoaded: false
+    property int timeoutMinutes: 15
+    property bool persistSession: false
+    property int expiresInSeconds: 0
 
     readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
     readonly property string helper: configHome + "/quickshell/caelestia/scripts/caelestia-vault"
@@ -66,6 +69,20 @@ Item {
         actionProc.running = true;
     }
 
+    function queueSettingsSave(): void {
+        settingsSave.restart();
+    }
+
+    function timeoutDescription(): string {
+        if (root.timeoutMinutes === 0)
+            return "Automatic lock disabled";
+        if (root.unlocked && root.expiresInSeconds > 0) {
+            const remaining = Math.max(1, Math.ceil(root.expiresInSeconds / 60));
+            return `Locks after ${root.timeoutMinutes} min of inactivity (${remaining} min remaining)`;
+        }
+        return `Locks after ${root.timeoutMinutes} min of inactivity`;
+    }
+
     Component.onCompleted: refreshStatus()
 
     Process {
@@ -78,8 +95,16 @@ Item {
                     root.vaultStatus = data.status || "error";
                     root.userEmail = data.userEmail || "";
                     root.serverUrl = data.serverUrl || "";
-                    if (root.unlocked)
+                    root.timeoutMinutes = data.timeoutMinutes ?? 15;
+                    root.persistSession = data.persist ?? false;
+                    root.expiresInSeconds = data.expiresInSeconds ?? 0;
+                    if (root.unlocked) {
                         root.loadItems(false);
+                    } else {
+                        root.allItems = [];
+                        root.items = [];
+                        root.itemsLoaded = false;
+                    }
                 } catch (error) {
                     root.vaultStatus = "error";
                     root.message = "Could not reach Bitwarden";
@@ -156,9 +181,21 @@ Item {
     }
 
     Timer {
+        id: settingsSave
+        interval: 350
+        onTriggered: {
+            if (actionProc.running) {
+                restart();
+                return;
+            }
+            root.runAction(["configure", root.timeoutMinutes.toString(), root.persistSession.toString()], "Vault settings saved");
+        }
+    }
+
+    Timer {
         interval: 1000
         repeat: true
-        running: root.visible && !root.unlocked
+        running: root.visible
         onTriggered: root.refreshStatus()
     }
 
@@ -257,10 +294,84 @@ Item {
             }
         }
 
+        StyledRect {
+            Layout.fillWidth: true
+            implicitHeight: settingsRow.implicitHeight + Tokens.padding.small * 2
+            radius: Tokens.rounding.medium
+            color: Colours.tPalette.m3surfaceContainer
+
+            RowLayout {
+                id: settingsRow
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: Tokens.padding.medium
+                anchors.rightMargin: Tokens.padding.medium
+                spacing: Tokens.spacing.medium
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+
+                    StyledText {
+                        text: "Session timeout"
+                        font: Tokens.font.body.medium
+                        color: Colours.palette.m3onSurface
+                    }
+                    StyledText {
+                        text: root.timeoutDescription()
+                        font: Tokens.font.body.small
+                        color: Colours.palette.m3onSurfaceVariant
+                    }
+                }
+
+                StyledSpinBox {
+                    id: timeoutSpin
+                    from: 0
+                    to: 525600
+                    stepSize: 1
+                    value: root.timeoutMinutes
+                    onValueModified: {
+                        root.timeoutMinutes = Math.round(value);
+                        root.queueSettingsSave();
+                    }
+                }
+
+                StyledText {
+                    text: "minutes"
+                    font: Tokens.font.body.small
+                    color: Colours.palette.m3onSurfaceVariant
+                }
+
+                ColumnLayout {
+                    spacing: 0
+
+                    StyledText {
+                        text: "Persist after restart"
+                        font: Tokens.font.body.medium
+                        color: Colours.palette.m3onSurface
+                    }
+                    StyledText {
+                        text: root.persistSession ? "Session stored in GNOME Keyring" : "Session kept only in broker memory"
+                        font: Tokens.font.body.small
+                        color: root.persistSession ? Colours.palette.m3error : Colours.palette.m3onSurfaceVariant
+                    }
+                }
+
+                StyledSwitch {
+                    checked: root.persistSession
+                    onToggled: {
+                        root.persistSession = checked;
+                        root.queueSettingsSave();
+                    }
+                }
+            }
+        }
+
         StyledText {
             Layout.fillWidth: true
             Layout.leftMargin: Tokens.padding.small
-            text: root.message || (root.unlocked ? "Passwords stay hidden. Copy them only when needed." : "The unlocked session is stored in GNOME Keyring.")
+            text: root.message || (root.unlocked ? "Passwords are fetched only when copied and are never cached on disk." : "Unlock to start an in-memory vault session.")
             font: Tokens.font.body.small
             color: Colours.palette.m3onSurfaceVariant
         }

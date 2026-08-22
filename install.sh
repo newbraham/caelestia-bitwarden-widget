@@ -4,12 +4,14 @@ set -euo pipefail
 
 readonly PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SOURCE_DIR="$PROJECT_DIR/src"
+readonly BROKER_MANIFEST="$PROJECT_DIR/Cargo.toml"
 
 widget_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 widget_state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
 target_dir="${CAELESTIA_CONFIG_DIR:-$widget_config_home/quickshell/caelestia}"
 system_dir="${CAELESTIA_SYSTEM_DIR:-/etc/xdg/quickshell/caelestia}"
 state_dir="${CAELESTIA_STATE_DIR:-$widget_state_home/caelestia-bitwarden-widget}"
+settings_dir="${CAELESTIA_SETTINGS_DIR:-$widget_config_home/caelestia-vault}"
 
 action="install"
 restart_shell=1
@@ -17,6 +19,8 @@ install_deps=0
 skip_deps=0
 force=0
 adopt_created=0
+build_dir=""
+helper_source=""
 
 readonly -a MODIFIED_FILES=(
     "modules/Shortcuts.qml"
@@ -76,6 +80,37 @@ sha256() {
     sha256sum "$1" | cut -d' ' -f1
 }
 
+cleanup_build() {
+    [[ -n "$build_dir" && -d "$build_dir" ]] || return 0
+    case "$(basename "$build_dir")" in
+        caelestia-vault-build.*) find "$build_dir" -depth -delete ;;
+        *) die "refusing to remove unexpected build directory: $build_dir" ;;
+    esac
+}
+
+trap cleanup_build EXIT
+
+build_helper() {
+    [[ -f "$BROKER_MANIFEST" ]] || die "broker manifest is missing: $BROKER_MANIFEST"
+    command -v cargo >/dev/null 2>&1 || die "missing dependency: cargo"
+    build_dir="$(mktemp -d "${TMPDIR:-/tmp}/caelestia-vault-build.XXXXXX")"
+    helper_source="$build_dir/target/release/caelestia-vault"
+    log "building the local vault broker"
+    CARGO_TARGET_DIR="$build_dir/target" cargo build --locked --release \
+        --manifest-path "$BROKER_MANIFEST"
+    chmod 700 "$helper_source"
+}
+
+source_path() {
+    local rel="$1"
+    if [[ "$rel" == "scripts/caelestia-vault" ]]; then
+        [[ -x "$helper_source" ]] || die "vault broker was not built"
+        printf '%s' "$helper_source"
+    else
+        printf '%s/%s' "$SOURCE_DIR" "$rel"
+    fi
+}
+
 registered_hash() {
     local rel="$1" manifest="$state_dir/installed.sha256"
     [[ -r "$manifest" ]] || return 1
@@ -98,7 +133,7 @@ write_installed_manifest() {
 
 missing_dependencies() {
     local command_name
-    for command_name in bw jq secret-tool wl-copy openssl qs caelestia; do
+    for command_name in bw cargo jq secret-tool wl-copy qs caelestia; do
         command -v "$command_name" >/dev/null 2>&1 || printf '%s\n' "$command_name"
     done
     if ! command -v foot >/dev/null 2>&1 && ! command -v kitty >/dev/null 2>&1; then
@@ -121,7 +156,7 @@ install_dependencies() {
     fi
     command -v pacman >/dev/null 2>&1 || die "--install-deps currently supports Arch Linux only"
     log "installing dependencies"
-    sudo pacman -S --needed bitwarden bitwarden-cli jq libsecret wl-clipboard openssl foot
+    sudo pacman -S --needed bitwarden bitwarden-cli rust jq libsecret wl-clipboard foot
 }
 
 validate_target() {
@@ -132,7 +167,7 @@ validate_target() {
         registered="$(registered_hash "$rel" || true)"
         if [[ -n "$registered" ]]; then
             current="$(sha256 "$dest")"
-            custom="$(sha256 "$SOURCE_DIR/$rel")"
+            custom="$(sha256 "$(source_path "$rel")")"
             if [[ "$current" != "$custom" && "$current" != "$registered" && "$force" -ne 1 ]]; then
                 die "$rel contains changes made after installation; review them before using --force"
             fi
@@ -142,7 +177,7 @@ validate_target() {
     for rel in "${ADDED_FILES[@]}"; do
         dest="$target_dir/$rel"
         registered="$(registered_hash "$rel" || true)"
-        [[ ! -e "$dest" || "$(sha256 "$dest")" == "$(sha256 "$SOURCE_DIR/$rel")" \
+        [[ ! -e "$dest" || "$(sha256 "$dest")" == "$(sha256 "$(source_path "$rel")")" \
             || "$(sha256 "$dest")" == "$registered" || "$force" -eq 1 ]] \
             || die "$rel already exists with different content"
     done
@@ -152,7 +187,7 @@ is_installed() {
     local rel
     for rel in "${OWNED_FILES[@]}"; do
         [[ -f "$target_dir/$rel" ]] || return 1
-        [[ "$(sha256 "$target_dir/$rel")" == "$(sha256 "$SOURCE_DIR/$rel")" ]] || return 1
+        [[ "$(sha256 "$target_dir/$rel")" == "$(sha256 "$(source_path "$rel")")" ]] || return 1
     done
 }
 
@@ -180,12 +215,27 @@ create_backup() {
 }
 
 install_files() {
-    local rel mode
+    local rel mode source
     for rel in "${OWNED_FILES[@]}"; do
         mode=0644
         [[ "$rel" == "scripts/caelestia-vault" ]] && mode=0700
-        install -Dm"$mode" "$SOURCE_DIR/$rel" "$target_dir/$rel"
+        source="$(source_path "$rel")"
+        install -Dm"$mode" "$source" "$target_dir/$rel"
     done
+}
+
+stop_running_helper() {
+    local helper="$target_dir/scripts/caelestia-vault"
+    [[ -x "$helper" ]] || return 0
+    "$helper" shutdown >/dev/null 2>&1 \
+        || "$helper" lock >/dev/null 2>&1 \
+        || true
+}
+
+start_helper() {
+    local helper="$target_dir/scripts/caelestia-vault"
+    [[ -x "$helper" ]] || die "installed vault broker is missing"
+    "$helper" status >/dev/null || die "could not start the vault broker"
 }
 
 caelestia_pids() {
@@ -214,10 +264,13 @@ purge_vault_data() {
     runtime_base="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     runtime_dir="$runtime_base/caelestia-vault"
 
+    stop_running_helper
+
     # Remove only secrets owned by this integration.
     if command -v secret-tool >/dev/null 2>&1; then
         secret-tool clear application caelestia-vault >/dev/null 2>&1 || true
         secret-tool clear application caelestia-vault-cache >/dev/null 2>&1 || true
+        secret-tool clear application caelestia-vault-session-v2 >/dev/null 2>&1 || true
     fi
 
     # The widget owns the CLI login, so uninstalling logs it out.
@@ -232,6 +285,10 @@ purge_vault_data() {
     [[ "$(basename "$runtime_dir")" == "caelestia-vault" ]] \
         || die "unexpected runtime directory: $runtime_dir"
     rm -rf -- "$runtime_dir"
+    case "$settings_dir" in
+        "$widget_config_home"/caelestia-vault) rm -rf -- "$settings_dir" ;;
+        *) die "refusing to remove unexpected settings directory: $settings_dir" ;;
+    esac
     log "removed the session, cache, clipboard, and local Bitwarden CLI login"
 }
 
@@ -239,6 +296,7 @@ install_widget() {
     local created_config=0 backup_dir
     install_dependencies
     check_dependencies
+    build_helper
     [[ -d "$system_dir" ]] || die "base config was not found: $system_dir"
 
     if [[ ! -d "$target_dir" ]]; then
@@ -254,18 +312,22 @@ install_widget() {
         if is_installed; then
             log "widget is already installed"
         else
+            stop_running_helper
             install_files
             log "updated widget in $target_dir; kept the original backup"
         fi
         write_installed_manifest
+        start_helper
         restart_caelestia
         return
     fi
 
     mkdir -p "$state_dir/backups"
     backup_dir="$(create_backup "$created_config")"
+    stop_running_helper
     install_files
     write_installed_manifest
+    start_helper
     log "installed in $target_dir"
     log "backup: $backup_dir"
     restart_caelestia
@@ -310,6 +372,7 @@ uninstall_widget() {
 check_installation() {
     local count=0 status="not-installed" pid
     check_dependencies
+    build_helper
     [[ -d "$target_dir" ]] || die "user config is missing"
     is_installed && status="installed"
     while read -r pid; do
