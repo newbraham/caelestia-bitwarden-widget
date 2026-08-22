@@ -19,7 +19,7 @@ It stops if it finds an unsupported version or local changes it does not recogni
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/caelestia-bitwarden-widget.git
+git clone https://github.com/newbraham/caelestia-bitwarden-widget.git
 cd caelestia-bitwarden-widget
 ./install.sh --install-deps
 ```
