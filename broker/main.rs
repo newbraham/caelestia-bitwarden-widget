@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::{OsStr, OsString, c_int, c_void};
 use std::fs::{self, OpenOptions};
@@ -106,6 +107,7 @@ struct AppPaths {
 struct Broker {
     session: Option<LockedSecret>,
     metadata: Vec<u8>,
+    field_cache: HashMap<Vec<u8>, LockedSecret>,
     settings: Settings,
     paths: AppPaths,
 }
@@ -267,6 +269,7 @@ impl Broker {
         let mut broker = Self {
             session: None,
             metadata: Vec::new(),
+            field_cache: HashMap::new(),
             settings,
             paths,
         };
@@ -439,6 +442,7 @@ impl Broker {
         self.session = Some(session);
         zero_bytes(&mut self.metadata);
         self.metadata.clear();
+        self.field_cache.clear();
         self.settings.last_activity_unix = now_unix();
         if self.settings.persist {
             let session = self.session.as_ref().unwrap();
@@ -494,6 +498,17 @@ impl Broker {
     }
 
     fn copy_field(&mut self, kind: &str, id: &OsStr) -> Result<(), String> {
+        let cache_key = field_cache_key(kind, id);
+        if let Some(value) = self.field_cache.get(&cache_key) {
+            copy_to_clipboard(&value.bytes).map_err(|error| error.to_string())?;
+            self.touch();
+            notify(
+                "Copied for 30 seconds",
+                "The clipboard will be cleared automatically.",
+            );
+            return Ok(());
+        }
+
         let session = self.session_copy()?;
         let mut value = match kind {
             "username" => run_bw_through_jq_os(
@@ -511,9 +526,10 @@ impl Broker {
         if value.is_empty() {
             return Err("This item does not contain that field".into());
         }
-        let copy_result = copy_to_clipboard(&value);
-        zero_bytes(&mut value);
-        copy_result.map_err(|error| error.to_string())?;
+        let value = LockedSecret::new(value)
+            .map_err(|error| format!("could not lock field cache memory: {error}"))?;
+        copy_to_clipboard(&value.bytes).map_err(|error| error.to_string())?;
+        self.field_cache.insert(cache_key, value);
         self.touch();
         notify(
             "Copied for 30 seconds",
@@ -559,6 +575,7 @@ impl Broker {
         }
         zero_bytes(&mut self.metadata);
         self.metadata.clear();
+        self.field_cache.clear();
         self.touch();
         notify("Vault synced", "");
         Ok(())
@@ -576,6 +593,7 @@ impl Broker {
         self.session = None;
         zero_bytes(&mut self.metadata);
         self.metadata.clear();
+        self.field_cache.clear();
         self.settings.last_activity_unix = 0;
         let _ = self.save_settings();
         secret_clear(SESSION_KEY_ID);
@@ -615,6 +633,14 @@ impl Broker {
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
         fs::rename(temporary, &self.paths.settings)
     }
+}
+
+fn field_cache_key(kind: &str, id: &OsStr) -> Vec<u8> {
+    let mut key = Vec::with_capacity(kind.len() + id.as_bytes().len() + 1);
+    key.extend_from_slice(kind.as_bytes());
+    key.push(0);
+    key.extend_from_slice(id.as_bytes());
+    key
 }
 
 fn load_settings(path: &Path) -> Settings {
@@ -697,7 +723,9 @@ fn run_bw_through_jq_os(
 
 fn copy_to_clipboard(value: &[u8]) -> io::Result<()> {
     let mut child = Command::new("wl-copy")
-        .args(["--foreground", "--sensitive", "--paste-once"])
+        // Clipboard watchers request the value once to inspect its MIME metadata.
+        // With --paste-once that inspection consumes the user's only paste.
+        .args(["--foreground", "--sensitive"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1044,6 +1072,7 @@ mod tests {
         let broker = Broker {
             session: LockedSecret::new(b"test-session".to_vec()).ok(),
             metadata: Vec::new(),
+            field_cache: HashMap::new(),
             settings,
             paths: resolve_paths().unwrap(),
         };
@@ -1055,6 +1084,19 @@ mod tests {
         assert_eq!(
             error_json("bad \"value\""),
             "{\"error\":\"bad \\\"value\\\"\"}"
+        );
+    }
+
+    #[test]
+    fn field_cache_separates_item_and_field() {
+        let id = OsStr::new("item-1");
+        assert_ne!(
+            field_cache_key("username", id),
+            field_cache_key("password", id)
+        );
+        assert_ne!(
+            field_cache_key("password", id),
+            field_cache_key("password", OsStr::new("item-2"))
         );
     }
 }

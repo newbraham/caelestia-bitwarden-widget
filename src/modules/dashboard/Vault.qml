@@ -63,6 +63,8 @@ Item {
     function runAction(args: list<string>, successMessage: string): void {
         if (actionProc.running)
             return;
+        if ((args[0] || "").startsWith("copy-"))
+            root.message = "Retrieving the value from Bitwarden...";
         actionProc.successMessage = successMessage;
         actionProc.actionName = args[0] || "";
         actionProc.command = [root.helper].concat(args);
@@ -449,6 +451,7 @@ Item {
 
                         IconTextButton {
                             visible: !!itemCard.modelData.username
+                            disabled: actionProc.running
                             icon: "person"
                             text: "Username"
                             horizontalPadding: Tokens.padding.small
@@ -457,6 +460,7 @@ Item {
                         }
                         IconTextButton {
                             visible: itemCard.modelData.hasPassword
+                            disabled: actionProc.running
                             icon: "password"
                             text: "Password"
                             horizontalPadding: Tokens.padding.small
@@ -465,6 +469,7 @@ Item {
                         }
                         IconTextButton {
                             visible: itemCard.modelData.hasTotp
+                            disabled: actionProc.running
                             icon: "timer"
                             text: "TOTP"
                             horizontalPadding: Tokens.padding.small
