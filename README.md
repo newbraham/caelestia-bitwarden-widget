@@ -6,15 +6,16 @@ and links to saved sites. Passkeys stay in the official Bitwarden browser extens
 
 ## Requirements
 
-- Caelestia Shell `2.2.0`
-- Quickshell `0.3.x`
+- Caelestia Shell
+- Quickshell
 - Wayland with Hyprland
 - Bitwarden CLI
 - `jq`, `libsecret`, `wl-clipboard`, and `openssl`
 - `foot` or `kitty`
 
-The installer checks the Caelestia version and the hashes of every file it changes.
-It stops if it finds an unsupported version or local changes it does not recognize.
+This project does not guarantee compatibility with any specific Caelestia or Quickshell
+version. The installer replaces Caelestia configuration files, so install it at your own
+risk. A backup is created for uninstalling, but you should keep your own backup too.
 
 ## Install
 
@@ -70,8 +71,8 @@ widget is installed.
 
 ## Development
 
-Files under `src/` are installed over the user copy of Caelestia. When adding support
-for a new Caelestia release, update the hashes in `compat/` before publishing it.
+Files under `src/` are installed over the user copy of Caelestia. Compatibility with
+upstream releases is not tracked or enforced by this project.
 
 ## License
 

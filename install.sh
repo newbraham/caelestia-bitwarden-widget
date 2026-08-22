@@ -4,8 +4,6 @@ set -euo pipefail
 
 readonly PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SOURCE_DIR="$PROJECT_DIR/src"
-readonly COMPAT_FILE="$PROJECT_DIR/compat/caelestia-2.2.0.sha256"
-readonly SUPPORTED_VERSION="2.2.0"
 
 widget_config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 widget_state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -31,8 +29,6 @@ readonly -a ADDED_FILES=(
     "scripts/caelestia-vault"
 )
 readonly -a OWNED_FILES=("${MODIFIED_FILES[@]}" "${ADDED_FILES[@]}")
-
-declare -A BASE_HASHES=()
 
 log() {
     printf '[caelestia-vault] %s\n' "$*"
@@ -76,14 +72,6 @@ while (($#)); do
     shift
 done
 
-load_compatibility() {
-    [[ -r "$COMPAT_FILE" ]] || die "compatibility manifest is missing"
-    while read -r hash rel; do
-        [[ -n "$hash" && -n "$rel" ]] || continue
-        BASE_HASHES["$rel"]="$hash"
-    done <"$COMPAT_FILE"
-}
-
 sha256() {
     sha256sum "$1" | cut -d' ' -f1
 }
@@ -106,24 +94,6 @@ write_installed_manifest() {
     done
     chmod 600 "$manifest_tmp"
     mv -f -- "$manifest_tmp" "$state_dir/installed.sha256"
-}
-
-installed_version() {
-    if [[ -n "${CAELESTIA_VERSION_OVERRIDE:-}" ]]; then
-        printf '%s' "$CAELESTIA_VERSION_OVERRIDE"
-    elif command -v pacman >/dev/null 2>&1 && pacman -Q caelestia-shell >/dev/null 2>&1; then
-        pacman -Q caelestia-shell | awk '{print $2}' | cut -d- -f1
-    else
-        printf 'unknown'
-    fi
-}
-
-check_version() {
-    local version
-    version="$(installed_version)"
-    if [[ "$version" != "$SUPPORTED_VERSION" && "$force" -ne 1 ]]; then
-        die "Caelestia $SUPPORTED_VERSION is required; found $version (use --force to override)"
-    fi
 }
 
 missing_dependencies() {
@@ -155,16 +125,17 @@ install_dependencies() {
 }
 
 validate_target() {
-    local rel dest current expected custom registered
+    local rel dest current custom registered
     for rel in "${MODIFIED_FILES[@]}"; do
         dest="$target_dir/$rel"
         [[ -f "$dest" ]] || die "base file is missing: $dest"
-        current="$(sha256 "$dest")"
-        expected="${BASE_HASHES[$rel]:-}"
-        custom="$(sha256 "$SOURCE_DIR/$rel")"
         registered="$(registered_hash "$rel" || true)"
-        if [[ "$current" != "$expected" && "$current" != "$custom" && "$current" != "$registered" && "$force" -ne 1 ]]; then
-            die "$rel contains unrecognized changes; review them before using --force"
+        if [[ -n "$registered" ]]; then
+            current="$(sha256 "$dest")"
+            custom="$(sha256 "$SOURCE_DIR/$rel")"
+            if [[ "$current" != "$custom" && "$current" != "$registered" && "$force" -ne 1 ]]; then
+                die "$rel contains changes made after installation; review them before using --force"
+            fi
         fi
     done
 
@@ -186,7 +157,7 @@ is_installed() {
 }
 
 create_backup() {
-    local created_config="$1" rel src backup_dir current custom base
+    local created_config="$1" rel src backup_dir
     backup_dir="$state_dir/backups/$(date +%Y%m%d-%H%M%S)-$$"
     mkdir -p "$backup_dir"
     chmod 700 "$state_dir" "$state_dir/backups" "$backup_dir"
@@ -195,16 +166,7 @@ create_backup() {
         src="$target_dir/$rel"
         mkdir -p "$backup_dir/$(dirname "$rel")"
         if [[ -e "$src" ]]; then
-            current="$(sha256 "$src")"
-            custom="$(sha256 "$SOURCE_DIR/$rel")"
-            base="${BASE_HASHES[$rel]:-}"
-            if [[ "$current" == "$custom" && -n "$base" && -f "$system_dir/$rel" && "$(sha256 "$system_dir/$rel")" == "$base" ]]; then
-                cp -a "$system_dir/$rel" "$backup_dir/$rel"
-            elif [[ "$current" == "$custom" && -z "$base" ]]; then
-                : >"$backup_dir/$rel.missing"
-            else
-                cp -a "$src" "$backup_dir/$rel"
-            fi
+            cp -a "$src" "$backup_dir/$rel"
         else
             : >"$backup_dir/$rel.missing"
         fi
@@ -277,7 +239,6 @@ install_widget() {
     local created_config=0 backup_dir
     install_dependencies
     check_dependencies
-    check_version
     [[ -d "$system_dir" ]] || die "base config was not found: $system_dir"
 
     if [[ ! -d "$target_dir" ]]; then
@@ -349,7 +310,6 @@ uninstall_widget() {
 check_installation() {
     local count=0 status="not-installed" pid
     check_dependencies
-    check_version
     [[ -d "$target_dir" ]] || die "user config is missing"
     is_installed && status="installed"
     while read -r pid; do
@@ -359,7 +319,6 @@ check_installation() {
     [[ "$status" == "installed" && "$count" -le 1 ]]
 }
 
-load_compatibility
 case "$action" in
     install) install_widget ;;
     uninstall) uninstall_widget ;;
