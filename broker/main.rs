@@ -10,6 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::ptr::NonNull;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +29,11 @@ const PR_SET_NO_NEW_PRIVS: c_int = 38;
 const RLIMIT_CORE: c_int = 4;
 const LOCK_EX: c_int = 2;
 const LOCK_NB: c_int = 4;
+const PROT_READ: c_int = 1;
+const PROT_WRITE: c_int = 2;
+const MAP_PRIVATE: c_int = 2;
+const MAP_ANONYMOUS: c_int = 0x20;
+const SC_PAGESIZE: c_int = 30;
 
 #[repr(C)]
 struct RLimit {
@@ -40,41 +46,107 @@ unsafe extern "C" {
     fn setrlimit(resource: c_int, limit: *const RLimit) -> c_int;
     fn mlock(address: *const c_void, length: usize) -> c_int;
     fn munlock(address: *const c_void, length: usize) -> c_int;
+    fn mmap(
+        address: *mut c_void,
+        length: usize,
+        protection: c_int,
+        flags: c_int,
+        file_descriptor: c_int,
+        offset: i64,
+    ) -> *mut c_void;
+    fn munmap(address: *mut c_void, length: usize) -> c_int;
+    fn sysconf(name: c_int) -> i64;
     fn flock(fd: c_int, operation: c_int) -> c_int;
 }
 
 struct LockedSecret {
-    bytes: Vec<u8>,
+    address: NonNull<u8>,
+    length: usize,
+    allocation_length: usize,
 }
 
+type FieldCache = HashMap<Vec<u8>, LockedSecret>;
+
 impl LockedSecret {
-    fn new(bytes: Vec<u8>) -> io::Result<Self> {
+    fn new(mut bytes: Vec<u8>) -> io::Result<Self> {
         if bytes.is_empty() {
             return Err(io::Error::new(ErrorKind::InvalidInput, "empty secret"));
         }
-        let result = unsafe { mlock(bytes.as_ptr().cast(), bytes.len()) };
-        if result != 0 {
-            let mut bytes = bytes;
+        let page_size = match unsafe { sysconf(SC_PAGESIZE) } {
+            size if size > 0 => size as usize,
+            _ => 4096,
+        };
+        let allocation_length = match bytes
+            .len()
+            .checked_add(page_size - 1)
+            .map(|length| length / page_size * page_size)
+        {
+            Some(length) => length,
+            None => {
+                zero_bytes(&mut bytes);
+                return Err(io::Error::other("secret allocation is too large"));
+            }
+        };
+        let raw_address = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                allocation_length,
+                PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if raw_address as isize == -1 {
             zero_bytes(&mut bytes);
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { bytes })
+        let Some(address) = NonNull::new(raw_address.cast::<u8>()) else {
+            zero_bytes(&mut bytes);
+            return Err(io::Error::other(
+                "secret allocation returned a null address",
+            ));
+        };
+        if unsafe { mlock(address.as_ptr().cast(), allocation_length) } != 0 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                munmap(address.as_ptr().cast(), allocation_length);
+            }
+            zero_bytes(&mut bytes);
+            return Err(error);
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.as_ptr(), bytes.len());
+        }
+        let length = bytes.len();
+        zero_bytes(&mut bytes);
+        Ok(Self {
+            address,
+            length,
+            allocation_length,
+        })
     }
 
     fn copy(&self) -> io::Result<Self> {
-        Self::new(self.bytes.clone())
+        Self::new(self.as_bytes().to_vec())
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.address.as_ptr(), self.length) }
     }
 
     fn as_os_str(&self) -> &OsStr {
-        OsStr::from_bytes(&self.bytes)
+        OsStr::from_bytes(self.as_bytes())
     }
 }
 
 impl Drop for LockedSecret {
     fn drop(&mut self) {
-        zero_bytes(&mut self.bytes);
         unsafe {
-            munlock(self.bytes.as_ptr().cast(), self.bytes.len());
+            let bytes = std::slice::from_raw_parts_mut(self.address.as_ptr(), self.length);
+            zero_bytes(bytes);
+            munlock(self.address.as_ptr().cast(), self.allocation_length);
+            munmap(self.address.as_ptr().cast(), self.allocation_length);
         }
     }
 }
@@ -107,7 +179,7 @@ struct AppPaths {
 struct Broker {
     session: Option<LockedSecret>,
     metadata: Vec<u8>,
-    field_cache: HashMap<Vec<u8>, LockedSecret>,
+    field_cache: FieldCache,
     settings: Settings,
     paths: AppPaths,
 }
@@ -419,7 +491,7 @@ impl Broker {
                 if let Err(error) = secret_store(
                     SESSION_KEY_ID,
                     "Caelestia Vault - persistent session",
-                    &session.bytes,
+                    session.as_bytes(),
                 ) {
                     self.settings.persist = false;
                     secret_clear(SESSION_KEY_ID);
@@ -449,7 +521,7 @@ impl Broker {
             if let Err(error) = secret_store(
                 SESSION_KEY_ID,
                 "Caelestia Vault - persistent session",
-                &session.bytes,
+                session.as_bytes(),
             ) {
                 self.session = None;
                 return Err(format!("could not persist the session: {error}"));
@@ -484,23 +556,36 @@ impl Broker {
             return Ok(self.metadata.clone());
         }
         let session = self.session_copy()?;
-        let filter = r#"[ .[] | select(.type == 1) | {id, name, type, username: (.login.username // ""), uri: (.login.uris[0].uri // ""), hasPassword: ((.login.password // "") != ""), hasTotp: ((.login.totp // "") != ""), passkeys: (.login.fido2Credentials // [] | length)} ] | sort_by(.name | ascii_downcase)"#;
-        let data = match run_bw_through_jq(&session, &["list", "items"], filter, false) {
+        let filter = r#"
+            ([.[] | select(.type == 1)]) as $items |
+            ([$items[] | {id, name, type, username: (.login.username // ""), uri: (.login.uris[0].uri // ""), hasPassword: ((.login.password // "") != ""), hasTotp: ((.login.totp // "") != ""), passkeys: (.login.fido2Credentials // [] | length)}] | sort_by(.name | ascii_downcase) | tojson | @base64 | "M\t\(.)"),
+            ($items[] | .id as $id |
+                (["S", "username", $id, ((.login.username // "") | @base64)] | @tsv),
+                (["S", "password", $id, ((.login.password // "") | @base64)] | @tsv),
+                (["S", "totp", $id, ((.login.totp // "") | @base64)] | @tsv)
+            )
+        "#;
+        let mut data = match run_bw_through_jq(&session, &["list", "items"], filter, true) {
             Ok(data) => data,
             Err(_) => {
                 self.lock_vault(false);
                 return Err("Session expired; connect again".into());
             }
         };
-        self.metadata = data.clone();
+        let parsed = parse_vault_cache_payload(&data);
+        zero_bytes(&mut data);
+        let (metadata, field_cache) = parsed?;
+        zero_bytes(&mut self.metadata);
+        self.metadata = metadata;
+        self.field_cache = field_cache;
         self.touch();
-        Ok(data)
+        Ok(self.metadata.clone())
     }
 
     fn copy_field(&mut self, kind: &str, id: &OsStr) -> Result<(), String> {
         let cache_key = field_cache_key(kind, id);
         if let Some(value) = self.field_cache.get(&cache_key) {
-            copy_to_clipboard(&value.bytes).map_err(|error| error.to_string())?;
+            copy_to_clipboard(value.as_bytes()).map_err(|error| error.to_string())?;
             self.touch();
             notify(
                 "Copied for 30 seconds",
@@ -528,7 +613,7 @@ impl Broker {
         }
         let value = LockedSecret::new(value)
             .map_err(|error| format!("could not lock field cache memory: {error}"))?;
-        copy_to_clipboard(&value.bytes).map_err(|error| error.to_string())?;
+        copy_to_clipboard(value.as_bytes()).map_err(|error| error.to_string())?;
         self.field_cache.insert(cache_key, value);
         self.touch();
         notify(
@@ -641,6 +726,91 @@ fn field_cache_key(kind: &str, id: &OsStr) -> Vec<u8> {
     key.push(0);
     key.extend_from_slice(id.as_bytes());
     key
+}
+
+fn parse_vault_cache_payload(payload: &[u8]) -> Result<(Vec<u8>, FieldCache), String> {
+    let mut metadata = None;
+    let mut field_cache = HashMap::new();
+
+    for line in payload
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if let Some(encoded) = line.strip_prefix(b"M\t") {
+            let decoded = base64_decode(encoded)?;
+            if !decoded.starts_with(b"[") {
+                return Err("invalid vault metadata payload".into());
+            }
+            metadata = Some(decoded);
+            continue;
+        }
+
+        let Some(secret) = line.strip_prefix(b"S\t") else {
+            return Err("invalid vault cache record".into());
+        };
+        let mut parts = secret.splitn(3, |byte| *byte == b'\t');
+        let kind = parts.next().ok_or("missing cache field kind")?;
+        let id = parts.next().ok_or("missing cache item ID")?;
+        let encoded = parts.next().ok_or("missing cache field value")?;
+        let kind = std::str::from_utf8(kind).map_err(|_| "invalid cache field kind")?;
+        if !matches!(kind, "username" | "password" | "totp") {
+            return Err("invalid cache field kind".into());
+        }
+        let value = base64_decode(encoded)?;
+        if value.is_empty() {
+            continue;
+        }
+        let value = LockedSecret::new(value)
+            .map_err(|error| format!("could not lock vault cache memory: {error}"))?;
+        field_cache.insert(field_cache_key(kind, OsStr::from_bytes(id)), value);
+    }
+
+    let metadata = metadata.ok_or("vault metadata is missing")?;
+    Ok((metadata, field_cache))
+}
+
+fn base64_decode(encoded: &[u8]) -> Result<Vec<u8>, String> {
+    if !encoded.len().is_multiple_of(4) {
+        return Err("invalid base64 cache value".into());
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
+    let chunks = encoded.chunks_exact(4);
+    let chunk_count = chunks.len();
+    for (index, chunk) in chunks.enumerate() {
+        let a = base64_digit(chunk[0]).ok_or("invalid base64 cache value")?;
+        let b = base64_digit(chunk[1]).ok_or("invalid base64 cache value")?;
+        decoded.push((a << 2) | (b >> 4));
+
+        if chunk[2] == b'=' {
+            if chunk[3] != b'=' || index + 1 != chunk_count {
+                return Err("invalid base64 cache padding".into());
+            }
+            continue;
+        }
+        let c = base64_digit(chunk[2]).ok_or("invalid base64 cache value")?;
+        decoded.push((b << 4) | (c >> 2));
+
+        if chunk[3] == b'=' {
+            if index + 1 != chunk_count {
+                return Err("invalid base64 cache padding".into());
+            }
+            continue;
+        }
+        let d = base64_digit(chunk[3]).ok_or("invalid base64 cache value")?;
+        decoded.push((c << 6) | d);
+    }
+    Ok(decoded)
+}
+
+fn base64_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 fn load_settings(path: &Path) -> Settings {
@@ -870,7 +1040,7 @@ fn unlock_interactive() -> Result<(), String> {
     }
     let locked = LockedSecret::new(session)
         .map_err(|error| format!("could not lock session memory: {error}"))?;
-    let mut request = vec![b"set-session".to_vec(), locked.bytes.clone()];
+    let mut request = vec![b"set-session".to_vec(), locked.as_bytes().to_vec()];
     let response = send_request(&request).map_err(|error| error.to_string())?;
     zero_bytes(&mut request[1]);
     if response.starts_with(b"{\"error\"") {
@@ -1098,5 +1268,12 @@ mod tests {
             field_cache_key("password", id),
             field_cache_key("password", OsStr::new("item-2"))
         );
+    }
+
+    #[test]
+    fn base64_cache_values_are_decoded() {
+        assert_eq!(base64_decode(b"c2VjcmV0").unwrap(), b"secret");
+        assert_eq!(base64_decode(b"YQ==").unwrap(), b"a");
+        assert!(base64_decode(b"invalid").is_err());
     }
 }

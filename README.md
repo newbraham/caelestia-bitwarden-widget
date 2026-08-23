@@ -59,8 +59,9 @@ Copied values stay in the clipboard for up to 30 seconds. They are sent through
 - The Bitwarden CLI session stays in broker memory unless persistence is explicitly enabled.
 - Session keys are passed through the process environment, not command-line arguments.
 - Searchable item metadata stays in broker and QML memory.
-- Fields retrieved for copying are cached individually in locked broker memory for the
-  current inactivity-timeout period. With timeout `0`, they remain until lock or restart.
+- Usernames, passwords, and TOTP seeds are preloaded into locked broker memory for the
+  current inactivity-timeout period. With timeout `0`, the complete decrypted login cache
+  remains in memory until lock or restart.
 - The broker disables core dumps and exposes only a mode `0600` Unix socket.
 - Locking, timeout, sync, session replacement, or broker restart clears the field cache.
 - Locking the Vault also clears its session, in-memory metadata, and clipboard contents.
