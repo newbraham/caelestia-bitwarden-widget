@@ -22,6 +22,7 @@ Item {
     property int timeoutMinutes: 15
     property bool persistSession: false
     property int expiresInSeconds: 0
+    property bool debugBroker: false
 
     readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
     readonly property string helper: configHome + "/quickshell/caelestia/scripts/caelestia-vault"
@@ -39,7 +40,9 @@ Item {
         if (!root.unlocked || listProc.running || (root.itemsLoaded && !force))
             return;
         root.message = "Loading vault items...";
+        listProc.errorText = "";
         listProc.command = force ? [root.helper, "list", "--refresh"] : [root.helper, "list"];
+        listProc.startedAt = Date.now();
         listProc.running = true;
     }
 
@@ -68,6 +71,7 @@ Item {
         actionProc.successMessage = successMessage;
         actionProc.actionName = args[0] || "";
         actionProc.command = [root.helper].concat(args);
+        actionProc.startedAt = Date.now();
         actionProc.running = true;
     }
 
@@ -100,6 +104,7 @@ Item {
                     root.timeoutMinutes = data.timeoutMinutes ?? 15;
                     root.persistSession = data.persist ?? false;
                     root.expiresInSeconds = data.expiresInSeconds ?? 0;
+                    root.debugBroker = data.debug ?? false;
                     if (root.unlocked) {
                         root.loadItems(false);
                     } else {
@@ -108,6 +113,7 @@ Item {
                         root.itemsLoaded = false;
                     }
                 } catch (error) {
+                    console.warn(`[caelestia-vault] event=status_parse_failed error=${error} response_bytes=${text.length}`);
                     root.vaultStatus = "error";
                     root.message = "Could not reach Bitwarden";
                 }
@@ -118,6 +124,7 @@ Item {
     Process {
         id: listProc
         property string errorText: ""
+        property double startedAt: 0
         command: [root.helper, "list"]
         stdout: StdioCollector {
             onStreamFinished: {
@@ -134,6 +141,7 @@ Item {
                         searchField.forceActiveFocus();
                     }
                 } catch (error) {
+                    console.warn(`[caelestia-vault] event=list_parse_failed duration_ms=${Date.now() - listProc.startedAt} error=${error} stdout_bytes=${text.length} stderr_bytes=${listProc.errorText.length}`);
                     root.allItems = [];
                     root.items = [];
                     root.message = listProc.errorText || "Could not read the vault response";
@@ -143,25 +151,33 @@ Item {
         stderr: StdioCollector {
             onStreamFinished: listProc.errorText = text.trim()
         }
-        onExited: root.refreshStatus()
+        onExited: {
+            if (root.debugBroker)
+                console.info(`[caelestia-vault] event=list_process_exited duration_ms=${Date.now() - listProc.startedAt} stderr_bytes=${listProc.errorText.length}`);
+            root.refreshStatus();
+        }
     }
 
     Process {
         id: actionProc
         property string successMessage: ""
         property string actionName: ""
+        property double startedAt: 0
         stdout: StdioCollector {
             onStreamFinished: {
                 try {
                     const data = JSON.parse(text || "{}");
                     root.message = data.error || actionProc.successMessage;
                 } catch (error) {
+                    console.warn(`[caelestia-vault] event=action_parse_failed action=${actionProc.actionName} duration_ms=${Date.now() - actionProc.startedAt} error=${error} response_bytes=${text.length}`);
                     if (actionProc.successMessage)
                         root.message = actionProc.successMessage;
                 }
             }
         }
         onExited: {
+            if (root.debugBroker)
+                console.info(`[caelestia-vault] event=action_process_exited action=${actionName} duration_ms=${Date.now() - actionProc.startedAt}`);
             if (actionName === "lock") {
                 root.vaultStatus = "locked";
                 root.allItems = [];
@@ -298,7 +314,7 @@ Item {
 
         StyledRect {
             Layout.fillWidth: true
-            implicitHeight: settingsRow.implicitHeight + Tokens.padding.small * 2
+            implicitHeight: settingsRow.implicitHeight + Tokens.padding.extraSmall * 2
             radius: Tokens.rounding.medium
             color: Colours.tPalette.m3surfaceContainer
 
@@ -307,64 +323,79 @@ Item {
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
-                anchors.leftMargin: Tokens.padding.medium
-                anchors.rightMargin: Tokens.padding.medium
-                spacing: Tokens.spacing.medium
+                anchors.leftMargin: Tokens.padding.small
+                anchors.rightMargin: Tokens.padding.small
+                spacing: Tokens.spacing.small
 
-                ColumnLayout {
+                RowLayout {
                     Layout.fillWidth: true
-                    spacing: 0
+                    Layout.preferredWidth: 1
+                    spacing: Tokens.spacing.small
 
-                    StyledText {
-                        text: "Session timeout"
-                        font: Tokens.font.body.medium
-                        color: Colours.palette.m3onSurface
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+
+                        StyledText {
+                            Layout.fillWidth: true
+                            text: "Session timeout"
+                            elide: Text.ElideRight
+                            font: Tokens.font.body.medium
+                            color: Colours.palette.m3onSurface
+                        }
+                        StyledText {
+                            Layout.fillWidth: true
+                            text: root.timeoutDescription()
+                            elide: Text.ElideRight
+                            font: Tokens.font.body.small
+                            color: Colours.palette.m3onSurfaceVariant
+                        }
                     }
-                    StyledText {
-                        text: root.timeoutDescription()
-                        font: Tokens.font.body.small
-                        color: Colours.palette.m3onSurfaceVariant
-                    }
-                }
 
-                StyledSpinBox {
-                    id: timeoutSpin
-                    from: 0
-                    to: 525600
-                    stepSize: 1
-                    value: root.timeoutMinutes
-                    onValueModified: {
-                        root.timeoutMinutes = Math.round(value);
-                        root.queueSettingsSave();
-                    }
-                }
-
-                StyledText {
-                    text: "minutes"
-                    font: Tokens.font.body.small
-                    color: Colours.palette.m3onSurfaceVariant
-                }
-
-                ColumnLayout {
-                    spacing: 0
-
-                    StyledText {
-                        text: "Persist after restart"
-                        font: Tokens.font.body.medium
-                        color: Colours.palette.m3onSurface
-                    }
-                    StyledText {
-                        text: root.persistSession ? "Session stored in GNOME Keyring" : "Session kept only in broker memory"
-                        font: Tokens.font.body.small
-                        color: root.persistSession ? Colours.palette.m3error : Colours.palette.m3onSurfaceVariant
+                    StyledSpinBox {
+                        id: timeoutSpin
+                        from: 0
+                        to: 525600
+                        stepSize: 1
+                        value: root.timeoutMinutes
+                        onValueModified: {
+                            root.timeoutMinutes = Math.round(value);
+                            root.queueSettingsSave();
+                        }
                     }
                 }
 
-                StyledSwitch {
-                    checked: root.persistSession
-                    onToggled: {
-                        root.persistSession = checked;
-                        root.queueSettingsSave();
+                RowLayout {
+                    Layout.fillWidth: true
+                    Layout.preferredWidth: 1
+                    spacing: Tokens.spacing.small
+
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 0
+
+                        StyledText {
+                            Layout.fillWidth: true
+                            text: "Persist after restart"
+                            elide: Text.ElideRight
+                            font: Tokens.font.body.medium
+                            color: Colours.palette.m3onSurface
+                        }
+                        StyledText {
+                            Layout.fillWidth: true
+                            text: root.persistSession ? "Stored in GNOME Keyring" : "Kept only in broker memory"
+                            elide: Text.ElideRight
+                            font: Tokens.font.body.small
+                            color: root.persistSession ? Colours.palette.m3error : Colours.palette.m3onSurfaceVariant
+                        }
+                    }
+
+                    StyledSwitch {
+                        checked: root.persistSession
+                        onToggled: {
+                            root.persistSession = checked;
+                            root.queueSettingsSave();
+                        }
                     }
                 }
             }

@@ -94,6 +94,85 @@ Files under `src/` are installed over the user copy of Caelestia. The installer 
 the Rust broker in `broker/main.rs` locally and installs the resulting binary. Compatibility
 with upstream releases is not tracked or enforced by this project.
 
+Use debug mode while developing or diagnosing an installation:
+
+```bash
+./install.sh --debug
+```
+
+Debug mode adds the following diagnostics:
+
+- It compiles the broker without Cargo's `--release` profile, preserving debug symbols
+  and Rust debug assertions.
+- It formats installer output with timestamps, levels, and components, and appends the
+  complete installation output (including Cargo) to
+  `~/.local/state/caelestia-bitwarden-widget/debug.log`.
+- The installed broker appends lifecycle and request-result events to the same log. It
+  never logs session values, vault fields, copied values, or vault item IDs.
+- Cargo runs verbosely under GNU `time` when available. The log includes elapsed time,
+  peak build RSS, page faults, exit status, host/cgroup memory limits and OOM counters,
+  swap, filesystem space, `ulimit` values, and Rust/tool versions.
+- Runtime requests have correlation IDs and durations. Health snapshots report broker
+  RSS and peak RSS, locked memory, threads, open file descriptors, metadata size, and
+  cached-field count. Subprocess events include only program/operation names, exit
+  code or signal, duration, and byte counts—not their output.
+- Panics include their source location and a full Rust backtrace. QML parse/process
+  failures are also sent to the Caelestia/Quickshell console with sizes rather than
+  response contents.
+
+Show the last 100 broker/installer events and keep following new ones:
+
+```bash
+tail -n 100 -F ~/.local/state/caelestia-bitwarden-widget/debug.log
+```
+
+To show only broker runtime events, filter the same stream:
+
+```bash
+tail -n 100 -F ~/.local/state/caelestia-bitwarden-widget/debug.log \
+  | rg --line-buffered '\[broker\]'
+```
+
+QML-side events such as malformed responses are in the Quickshell log instead:
+
+```bash
+qs log --newest --tail 100 --follow \
+  | rg --line-buffered 'caelestia-vault|Vault.qml'
+```
+
+Ask the running broker for a point-in-time, secret-free memory snapshot:
+
+```bash
+~/.config/quickshell/caelestia/scripts/caelestia-vault diagnostics | jq
+```
+
+Or collect a broader installation/build/runtime report without rebuilding the broker:
+
+```bash
+./install.sh --diagnose
+```
+
+If Cargo or `rustc` is killed, exits with code 137, or reports an allocation failure,
+use the low-memory build. It serializes compilation, disables incremental compilation,
+and, for release builds, disables LTO and raises the number of codegen units:
+
+```bash
+./install.sh --debug --low-memory
+```
+
+You can limit parallelism independently with `--build-jobs N`. For example:
+
+```bash
+./install.sh --debug --build-jobs 2
+```
+
+Runtime logging is compiled in only for debug builds. The mode `0600` log rotates
+continuously at 5 MiB and retains three older files, limiting the set to approximately
+20 MiB. `./install.sh --check` reports the installed profile, and the broker's `status`
+response includes `"debug": true` while the debug build is running. Run the regular
+installer again to return to a release build; release brokers do not write runtime debug
+events.
+
 ## License
 
 [MIT](LICENSE)

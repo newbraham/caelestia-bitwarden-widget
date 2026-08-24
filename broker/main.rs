@@ -11,8 +11,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::ptr::NonNull;
+use std::sync::Once;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const APP_ID: &str = "caelestia-vault";
 const SESSION_KEY_ID: &str = "caelestia-vault-session-v2";
@@ -23,6 +24,9 @@ const MAX_TIMEOUT_MINUTES: u32 = 525_600;
 const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(30);
 const MAX_PACKET_PARTS: u32 = 16;
 const MAX_PACKET_PART_SIZE: u32 = 1024 * 1024;
+const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const DEBUG_LOG_BACKUPS: usize = 3;
 
 const PR_SET_DUMPABLE: c_int = 4;
 const PR_SET_NO_NEW_PRIVS: c_int = 38;
@@ -33,6 +37,7 @@ const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_PRIVATE: c_int = 2;
 const MAP_ANONYMOUS: c_int = 0x20;
+const O_NOFOLLOW: c_int = 0x20000;
 const SC_PAGESIZE: c_int = 30;
 
 #[repr(C)]
@@ -98,8 +103,17 @@ impl LockedSecret {
             )
         };
         if raw_address as isize == -1 {
+            let error = io::Error::last_os_error();
+            process_log(
+                "ERROR",
+                &format!(
+                    "event=secure_allocation_failed stage=mmap allocation_kib={} error=\"{}\"",
+                    allocation_length / 1024,
+                    json_escape(&error.to_string())
+                ),
+            );
             zero_bytes(&mut bytes);
-            return Err(io::Error::last_os_error());
+            return Err(error);
         }
         let Some(address) = NonNull::new(raw_address.cast::<u8>()) else {
             zero_bytes(&mut bytes);
@@ -109,6 +123,17 @@ impl LockedSecret {
         };
         if unsafe { mlock(address.as_ptr().cast(), allocation_length) } != 0 {
             let error = io::Error::last_os_error();
+            let metrics = process_metrics();
+            process_log(
+                "ERROR",
+                &format!(
+                    "event=secure_allocation_failed stage=mlock allocation_kib={} locked_kib={} rss_kib={} error=\"{}\" hint=check_ulimit_l",
+                    allocation_length / 1024,
+                    metrics.locked_kib,
+                    metrics.rss_kib,
+                    json_escape(&error.to_string())
+                ),
+            );
             unsafe {
                 munmap(address.as_ptr().cast(), allocation_length);
             }
@@ -174,6 +199,8 @@ struct AppPaths {
     lock: PathBuf,
     settings_dir: PathBuf,
     settings: PathBuf,
+    state_dir: PathBuf,
+    debug_log: PathBuf,
 }
 
 struct Broker {
@@ -182,16 +209,39 @@ struct Broker {
     field_cache: FieldCache,
     settings: Settings,
     paths: AppPaths,
+    started_at: Instant,
+    last_health_log: Instant,
+    next_request_id: u64,
+}
+
+#[derive(Default)]
+struct ProcessMetrics {
+    rss_kib: u64,
+    peak_rss_kib: u64,
+    locked_kib: u64,
+    threads: u64,
+    open_fds: usize,
 }
 
 fn main() {
+    install_panic_hook();
     let mut args = env::args_os().skip(1);
     let first = args.next().unwrap_or_else(|| OsString::from("status"));
     let command = first.to_string_lossy();
 
     if command == "serve" {
         if let Err(error) = serve() {
-            eprintln!("{error}");
+            if cfg!(debug_assertions) {
+                process_log(
+                    "ERROR",
+                    &format!(
+                        "event=server_failed error=\"{}\"",
+                        json_escape(&error.to_string())
+                    ),
+                );
+            } else {
+                eprintln!("{error}");
+            }
             std::process::exit(1);
         }
         return;
@@ -230,6 +280,34 @@ fn main() {
     }
 }
 
+fn install_panic_hook() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let location = info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown".into());
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            process_log(
+                "ERROR",
+                &format!(
+                    "event=panic location=\"{}\" backtrace=\"{}\"",
+                    json_escape(&location),
+                    json_escape(&backtrace.to_string())
+                ),
+            );
+        }));
+    });
+}
+
 fn resolve_paths() -> io::Result<AppPaths> {
     let runtime_base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
@@ -238,14 +316,27 @@ fn resolve_paths() -> io::Result<AppPaths> {
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "config home is unavailable"))?;
+    let state_dir = env::var_os("CAELESTIA_STATE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+                })
+                .map(|state| state.join("caelestia-bitwarden-widget"))
+        })
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "state home is unavailable"))?;
     let runtime_dir = runtime_base.join(APP_ID);
     let settings_dir = config_base.join(APP_ID);
     Ok(AppPaths {
         socket: runtime_dir.join("broker.sock"),
         lock: runtime_dir.join("broker.lock"),
         settings: settings_dir.join("settings.conf"),
+        debug_log: state_dir.join("debug.log"),
         runtime_dir,
         settings_dir,
+        state_dir,
     })
 }
 
@@ -287,9 +378,216 @@ fn secure_directory(path: &Path) -> io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
+fn open_debug_log(paths: &AppPaths) -> io::Result<fs::File> {
+    secure_directory(&paths.state_dir)?;
+    if let Ok(metadata) = fs::symlink_metadata(&paths.debug_log)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to follow debug log symlink",
+        ));
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&paths.debug_log)?;
+    fs::set_permissions(&paths.debug_log, fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+fn rotated_debug_log(path: &Path, index: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    PathBuf::from(name)
+}
+
+fn rotate_debug_log(paths: &AppPaths) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(&paths.debug_log) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            ErrorKind::PermissionDenied,
+            "refusing to rotate debug log symlink",
+        ));
+    }
+    if metadata.len() < DEBUG_LOG_MAX_BYTES {
+        return Ok(());
+    }
+    for index in (1..=DEBUG_LOG_BACKUPS).rev() {
+        let source = if index == 1 {
+            paths.debug_log.clone()
+        } else {
+            rotated_debug_log(&paths.debug_log, index - 1)
+        };
+        let destination = rotated_debug_log(&paths.debug_log, index);
+        match fs::rename(&source, &destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn runtime_log(paths: &AppPaths, level: &str, event: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    let safe_event = event.replace(['\n', '\r'], " ");
+    let write = || -> io::Result<()> {
+        secure_directory(&paths.state_dir)?;
+        let lock_path = paths.state_dir.join("debug-log.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(lock_path)?;
+        if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        rotate_debug_log(paths)?;
+        let mut file = open_debug_log(paths)?;
+        writeln!(
+            file,
+            "{} [{level:<5}] [broker] pid={} {safe_event}",
+            iso8601_utc(now_unix()),
+            std::process::id()
+        )
+    };
+    let _ = write();
+}
+
+fn process_log(level: &str, event: &str) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    if let Ok(paths) = resolve_paths() {
+        runtime_log(&paths, level, event);
+    }
+}
+
+fn process_metrics() -> ProcessMetrics {
+    let mut metrics = ProcessMetrics::default();
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let mut fields = line.split_whitespace();
+            match fields.next() {
+                Some("VmRSS:") => {
+                    metrics.rss_kib = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0)
+                }
+                Some("VmHWM:") => {
+                    metrics.peak_rss_kib = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0)
+                }
+                Some("VmLck:") => {
+                    metrics.locked_kib = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0)
+                }
+                Some("Threads:") => {
+                    metrics.threads = fields
+                        .next()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(0)
+                }
+                _ => {}
+            }
+        }
+    }
+    metrics.open_fds = fs::read_dir("/proc/self/fd")
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    metrics
+}
+
+fn exit_status(status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    match (status.code(), status.signal()) {
+        (Some(code), _) => format!("exit_code={code}"),
+        (_, Some(signal)) => format!("signal={signal}"),
+        _ => "exit_status=unknown".into(),
+    }
+}
+
+fn safe_bw_operation(args: &[&OsStr]) -> &'static str {
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("list") => "list-items",
+        Some("get") => match args.get(1).and_then(|arg| arg.to_str()) {
+            Some("password") => "get-password",
+            Some("totp") => "get-totp",
+            Some("item") => "get-item",
+            _ => "get-field",
+        },
+        Some("sync") => "sync",
+        Some("lock") => "lock",
+        Some("status") => "status",
+        _ => "other",
+    }
+}
+
+fn log_external_io_error(program: &str, operation: &str, stage: &str, error: &io::Error) {
+    process_log(
+        "WARN",
+        &format!(
+            "event=external_command program={program} operation={operation} result=io_error stage={stage} error_kind={:?} error=\"{}\"",
+            error.kind(),
+            json_escape(&error.to_string())
+        ),
+    );
+}
+
+fn iso8601_utc(timestamp: i64) -> String {
+    let days = timestamp.div_euclid(86_400);
+    let seconds = timestamp.rem_euclid(86_400);
+    let shifted_days = days + 719_468;
+    let era = if shifted_days >= 0 {
+        shifted_days
+    } else {
+        shifted_days - 146_096
+    } / 146_097;
+    let day_of_era = shifted_days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    let hour = seconds / 3_600;
+    let minute = seconds % 3_600 / 60;
+    let second = seconds % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
 fn serve() -> io::Result<()> {
     harden_process();
     let paths = resolve_paths()?;
+    runtime_log(
+        &paths,
+        "INFO",
+        &format!(
+            "event=server_starting profile=debug pid={} version={} rust_backtrace={}",
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            env::var("RUST_BACKTRACE").unwrap_or_else(|_| "unset".into())
+        ),
+    );
     secure_directory(&paths.runtime_dir)?;
 
     let lock_file = OpenOptions::new()
@@ -300,6 +598,7 @@ fn serve() -> io::Result<()> {
         .mode(0o600)
         .open(&paths.lock)?;
     if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        runtime_log(&paths, "DEBUG", "event=server_already_running");
         return Ok(());
     }
 
@@ -307,9 +606,11 @@ fn serve() -> io::Result<()> {
     let listener = UnixListener::bind(&paths.socket)?;
     fs::set_permissions(&paths.socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    runtime_log(&paths, "INFO", "event=server_ready");
 
     let mut broker = Broker::new(paths);
     loop {
+        broker.maybe_log_health();
         if broker.is_expired() {
             broker.lock_vault(true);
         }
@@ -318,7 +619,26 @@ fn serve() -> io::Result<()> {
                 let request = read_packet(&mut stream);
                 let (response, shutdown) = match request {
                     Ok(parts) => broker.dispatch(parts),
-                    Err(_) => (error_json("invalid request").into_bytes(), false),
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        runtime_log(
+                            &broker.paths,
+                            "DEBUG",
+                            "event=connection_closed_before_request",
+                        );
+                        (error_json("invalid request").into_bytes(), false)
+                    }
+                    Err(error) => {
+                        runtime_log(
+                            &broker.paths,
+                            "WARN",
+                            &format!(
+                                "event=request_invalid error_kind={:?} error=\"{}\"",
+                                error.kind(),
+                                json_escape(&error.to_string())
+                            ),
+                        );
+                        (error_json("invalid request").into_bytes(), false)
+                    }
                 };
                 let _ = stream.write_all(&response);
                 if shutdown {
@@ -331,6 +651,7 @@ fn serve() -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    runtime_log(&broker.paths, "INFO", "event=server_stopped");
     let _ = fs::remove_file(&broker.paths.socket);
     Ok(())
 }
@@ -344,10 +665,54 @@ impl Broker {
             field_cache: HashMap::new(),
             settings,
             paths,
+            started_at: Instant::now(),
+            last_health_log: Instant::now(),
+            next_request_id: 1,
         };
         broker.remove_legacy_secrets();
         broker.restore_persistent_session();
+        runtime_log(
+            &broker.paths,
+            "DEBUG",
+            if broker.session.is_some() {
+                "event=broker_initialized session=restored"
+            } else {
+                "event=broker_initialized session=none"
+            },
+        );
         broker
+    }
+
+    fn maybe_log_health(&mut self) {
+        if self.last_health_log.elapsed() < HEALTH_LOG_INTERVAL {
+            return;
+        }
+        self.last_health_log = Instant::now();
+        self.log_health("periodic");
+    }
+
+    fn log_health(&self, reason: &str) {
+        let metrics = process_metrics();
+        runtime_log(
+            &self.paths,
+            "DEBUG",
+            &format!(
+                "event=health reason={reason} uptime_ms={} rss_kib={} peak_rss_kib={} locked_kib={} threads={} open_fds={} session={} metadata_bytes={} cached_fields={}",
+                self.started_at.elapsed().as_millis(),
+                metrics.rss_kib,
+                metrics.peak_rss_kib,
+                metrics.locked_kib,
+                metrics.threads,
+                metrics.open_fds,
+                if self.session.is_some() {
+                    "present"
+                } else {
+                    "none"
+                },
+                self.metadata.len(),
+                self.field_cache.len()
+            ),
+        );
     }
 
     fn remove_legacy_secrets(&self) {
@@ -392,12 +757,35 @@ impl Broker {
     }
 
     fn dispatch(&mut self, parts: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        let started = Instant::now();
         let command = parts
             .first()
             .map(|part| String::from_utf8_lossy(part))
             .unwrap_or_else(|| "status".into());
+        let logged_command = match command.as_ref() {
+            "status" | "set-session" | "configure" | "list" | "copy-username" | "copy-password"
+            | "copy-totp" | "open-uri" | "sync" | "lock" | "shutdown" | "open-app"
+            | "browser-extension" | "diagnostics" => command.as_ref(),
+            _ => "unknown",
+        };
+        if logged_command != "status" {
+            runtime_log(
+                &self.paths,
+                "DEBUG",
+                &format!(
+                    "event=request request_id={request_id} command={logged_command} parts={}",
+                    parts.len()
+                ),
+            );
+        }
         let result = match command.as_ref() {
             "status" => Ok(self.status_json().into_bytes()),
+            "diagnostics" => {
+                self.log_health("requested");
+                Ok(self.diagnostics_json().into_bytes())
+            }
             "set-session" => parts
                 .get(1)
                 .ok_or_else(|| "Bitwarden returned an empty session".to_string())
@@ -426,6 +814,14 @@ impl Broker {
             }
             "shutdown" => {
                 self.lock_vault(false);
+                runtime_log(
+                    &self.paths,
+                    "DEBUG",
+                    &format!(
+                        "event=request_completed request_id={request_id} command=shutdown result=ok duration_ms={}",
+                        started.elapsed().as_millis()
+                    ),
+                );
                 return (ok_json().as_bytes().to_vec(), true);
             }
             "open-app" => open_bitwarden().map(|_| ok_json().as_bytes().to_vec()),
@@ -437,8 +833,34 @@ impl Broker {
             _ => Err("unknown command".to_string()),
         };
         match result {
-            Ok(response) => (response, false),
-            Err(error) => (error_json(&error).into_bytes(), false),
+            Ok(response) => {
+                if logged_command != "status" {
+                    runtime_log(
+                        &self.paths,
+                        "DEBUG",
+                        &format!(
+                            "event=request_completed request_id={request_id} command={logged_command} result=ok duration_ms={}",
+                            started.elapsed().as_millis()
+                        ),
+                    );
+                }
+                (response, false)
+            }
+            Err(error) => {
+                let metrics = process_metrics();
+                runtime_log(
+                    &self.paths,
+                    "WARN",
+                    &format!(
+                        "event=request_completed request_id={request_id} command={logged_command} result=error duration_ms={} rss_kib={} peak_rss_kib={} error=\"{}\"",
+                        started.elapsed().as_millis(),
+                        metrics.rss_kib,
+                        metrics.peak_rss_kib,
+                        json_escape(&error)
+                    ),
+                );
+                (error_json(&error).into_bytes(), false)
+            }
         }
     }
 
@@ -461,8 +883,30 @@ impl Broker {
             0
         };
         format!(
-            "{{\"status\":\"{status}\",\"userEmail\":\"\",\"serverUrl\":\"\",\"timeoutMinutes\":{},\"persist\":{},\"expiresInSeconds\":{expires}}}",
-            self.settings.timeout_minutes, self.settings.persist
+            "{{\"status\":\"{status}\",\"userEmail\":\"\",\"serverUrl\":\"\",\"timeoutMinutes\":{},\"persist\":{},\"expiresInSeconds\":{expires},\"debug\":{},\"pid\":{}}}",
+            self.settings.timeout_minutes,
+            self.settings.persist,
+            cfg!(debug_assertions),
+            std::process::id()
+        )
+    }
+
+    fn diagnostics_json(&self) -> String {
+        let metrics = process_metrics();
+        format!(
+            "{{\"ok\":true,\"debug\":{},\"pid\":{},\"version\":\"{}\",\"uptimeMs\":{},\"rssKiB\":{},\"peakRssKiB\":{},\"lockedKiB\":{},\"threads\":{},\"openFds\":{},\"sessionLoaded\":{},\"metadataBytes\":{},\"cachedFields\":{}}}",
+            cfg!(debug_assertions),
+            std::process::id(),
+            env!("CARGO_PKG_VERSION"),
+            self.started_at.elapsed().as_millis(),
+            metrics.rss_kib,
+            metrics.peak_rss_kib,
+            metrics.locked_kib,
+            metrics.threads,
+            metrics.open_fds,
+            self.session.is_some(),
+            self.metadata.len(),
+            self.field_cache.len()
         )
     }
 
@@ -529,7 +973,13 @@ impl Broker {
         } else {
             secret_clear(SESSION_KEY_ID);
         }
-        self.save_settings().map_err(|error| error.to_string())
+        self.save_settings().map_err(|error| error.to_string())?;
+        runtime_log(
+            &self.paths,
+            "INFO",
+            &format!("event=session_loaded persistence={}", self.settings.persist),
+        );
+        Ok(())
     }
 
     fn session_copy(&mut self) -> Result<LockedSecret, String> {
@@ -648,14 +1098,33 @@ impl Broker {
 
     fn sync_vault(&mut self) -> Result<(), String> {
         let session = self.session_copy()?;
-        let status = Command::new("bw")
+        let started = Instant::now();
+        let output = Command::new("bw")
             .arg("sync")
             .env("BW_SESSION", session.as_os_str())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .stderr(Stdio::piped())
+            .output()
             .map_err(|error| error.to_string())?;
-        if !status.success() {
+        process_log(
+            if output.status.success() {
+                "DEBUG"
+            } else {
+                "WARN"
+            },
+            &format!(
+                "event=external_command program=bw operation=sync result={} {} duration_ms={} stderr_bytes={}",
+                if output.status.success() {
+                    "ok"
+                } else {
+                    "error"
+                },
+                exit_status(output.status),
+                started.elapsed().as_millis(),
+                output.stderr.len()
+            ),
+        );
+        if !output.status.success() {
             return Err("Sync failed".into());
         }
         zero_bytes(&mut self.metadata);
@@ -688,6 +1157,15 @@ impl Broker {
             .stderr(Stdio::null())
             .spawn();
         clear_clipboard();
+        runtime_log(
+            &self.paths,
+            "INFO",
+            if automatic {
+                "event=vault_locked reason=inactivity_timeout"
+            } else {
+                "event=vault_locked reason=request"
+            },
+        );
         if automatic {
             notify("Vault locked", "The inactivity timeout expired.");
         } else {
@@ -839,15 +1317,40 @@ fn load_settings(path: &Path) -> Settings {
 }
 
 fn run_bw_os(session: &LockedSecret, args: &[&OsStr]) -> io::Result<Vec<u8>> {
+    let started = Instant::now();
+    let operation = safe_bw_operation(args);
     let output = Command::new("bw")
         .args(args)
         .env("BW_SESSION", session.as_os_str())
-        .stderr(Stdio::null())
-        .output()?;
+        .stderr(Stdio::piped())
+        .output()
+        .inspect_err(|error| log_external_io_error("bw", operation, "spawn-or-wait", error))?;
+    process_log(
+        if output.status.success() {
+            "DEBUG"
+        } else {
+            "WARN"
+        },
+        &format!(
+            "event=external_command program=bw operation={operation} result={} {} duration_ms={} stdout_bytes={} stderr_bytes={}",
+            if output.status.success() {
+                "ok"
+            } else {
+                "error"
+            },
+            exit_status(output.status),
+            started.elapsed().as_millis(),
+            output.stdout.len(),
+            output.stderr.len()
+        ),
+    );
     if output.status.success() {
         Ok(output.stdout)
     } else {
-        Err(io::Error::other("Bitwarden command failed"))
+        Err(io::Error::other(format!(
+            "Bitwarden command failed ({})",
+            exit_status(output.status)
+        )))
     }
 }
 
@@ -867,12 +1370,15 @@ fn run_bw_through_jq_os(
     filter: &str,
     raw: bool,
 ) -> io::Result<Vec<u8>> {
+    let started = Instant::now();
+    let operation = safe_bw_operation(args);
     let mut bw = Command::new("bw")
         .args(args)
         .env("BW_SESSION", session.as_os_str())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .inspect_err(|error| log_external_io_error("bw", operation, "spawn", error))?;
     let stdout = bw
         .stdout
         .take()
@@ -881,17 +1387,39 @@ fn run_bw_through_jq_os(
     let jq_output = Command::new("jq")
         .args([jq_mode, filter])
         .stdin(Stdio::from(stdout))
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output();
-    let bw_status = bw.wait()?;
-    let jq_output = jq_output?;
-    if !bw_status.success() || !jq_output.status.success() {
-        return Err(io::Error::other("Bitwarden command failed"));
+    let bw_output = bw
+        .wait_with_output()
+        .inspect_err(|error| log_external_io_error("bw", operation, "wait", error))?;
+    let jq_output = jq_output
+        .inspect_err(|error| log_external_io_error("jq", operation, "spawn-or-wait", error))?;
+    let success = bw_output.status.success() && jq_output.status.success();
+    process_log(
+        if success { "DEBUG" } else { "WARN" },
+        &format!(
+            "event=external_pipeline programs=bw,jq operation={operation} result={} bw_{} jq_{} duration_ms={} output_bytes={} bw_stderr_bytes={} jq_stderr_bytes={}",
+            if success { "ok" } else { "error" },
+            exit_status(bw_output.status),
+            exit_status(jq_output.status),
+            started.elapsed().as_millis(),
+            jq_output.stdout.len(),
+            bw_output.stderr.len(),
+            jq_output.stderr.len()
+        ),
+    );
+    if !success {
+        return Err(io::Error::other(format!(
+            "Bitwarden pipeline failed (bw {}; jq {})",
+            exit_status(bw_output.status),
+            exit_status(jq_output.status)
+        )));
     }
     Ok(jq_output.stdout)
 }
 
 fn copy_to_clipboard(value: &[u8]) -> io::Result<()> {
+    let started = Instant::now();
     let mut child = Command::new("wl-copy")
         // Clipboard watchers request the value once to inspect its MIME metadata.
         // With --paste-once that inspection consumes the user's only paste.
@@ -899,13 +1427,24 @@ fn copy_to_clipboard(value: &[u8]) -> io::Result<()> {
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()?;
+        .spawn()
+        .inspect_err(|error| log_external_io_error("wl-copy", "copy", "spawn", error))?;
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("clipboard stdin is unavailable"))?;
     stdin.write_all(value)?;
     drop(stdin);
+    process_log(
+        "DEBUG",
+        &format!(
+            "event=clipboard_started pid={} payload_bytes={} setup_duration_ms={} lifetime_seconds={}",
+            child.id(),
+            value.len(),
+            started.elapsed().as_millis(),
+            CLIPBOARD_LIFETIME.as_secs()
+        ),
+    );
     thread::spawn(move || wait_for_clipboard(child));
     Ok(())
 }
@@ -914,13 +1453,39 @@ fn wait_for_clipboard(mut child: Child) {
     let started = SystemTime::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(status)) => {
+                process_log(
+                    "DEBUG",
+                    &format!(
+                        "event=clipboard_stopped reason=exited {} lifetime_ms={}",
+                        exit_status(status),
+                        started.elapsed().unwrap_or_default().as_millis()
+                    ),
+                );
+                return;
+            }
             Ok(None) => {}
-            Err(_) => return,
+            Err(error) => {
+                process_log(
+                    "WARN",
+                    &format!(
+                        "event=clipboard_wait_failed error=\"{}\"",
+                        json_escape(&error.to_string())
+                    ),
+                );
+                return;
+            }
         }
         if started.elapsed().unwrap_or_default() >= CLIPBOARD_LIFETIME {
             let _ = child.kill();
             let _ = child.wait();
+            process_log(
+                "DEBUG",
+                &format!(
+                    "event=clipboard_stopped reason=timeout lifetime_ms={}",
+                    started.elapsed().unwrap_or_default().as_millis()
+                ),
+            );
             return;
         }
         thread::sleep(Duration::from_millis(100));
@@ -928,11 +1493,31 @@ fn wait_for_clipboard(mut child: Child) {
 }
 
 fn secret_lookup(id: &str) -> Option<Vec<u8>> {
+    let started = Instant::now();
     let output = Command::new("secret-tool")
         .args(["lookup", "application", id])
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
         .ok()?;
+    process_log(
+        if output.status.success() {
+            "DEBUG"
+        } else {
+            "WARN"
+        },
+        &format!(
+            "event=external_command program=secret-tool operation=lookup result={} {} duration_ms={} stdout_bytes={} stderr_bytes={}",
+            if output.status.success() {
+                "ok"
+            } else {
+                "error"
+            },
+            exit_status(output.status),
+            started.elapsed().as_millis(),
+            output.stdout.len(),
+            output.stderr.len()
+        ),
+    );
     if !output.status.success() || output.stdout.is_empty() {
         return None;
     }
@@ -942,18 +1527,30 @@ fn secret_lookup(id: &str) -> Option<Vec<u8>> {
 }
 
 fn secret_store(id: &str, label: &str, value: &[u8]) -> io::Result<()> {
+    let started = Instant::now();
     let mut child = Command::new("secret-tool")
         .args(["store", &format!("--label={label}"), "application", id])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     child
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("keyring stdin is unavailable"))?
         .write_all(value)?;
-    let status = child.wait()?;
+    let output = child.wait_with_output()?;
+    let status = output.status;
+    process_log(
+        if status.success() { "DEBUG" } else { "WARN" },
+        &format!(
+            "event=external_command program=secret-tool operation=store result={} {} duration_ms={} stderr_bytes={}",
+            if status.success() { "ok" } else { "error" },
+            exit_status(status),
+            started.elapsed().as_millis(),
+            output.stderr.len()
+        ),
+    );
     if status.success() {
         Ok(())
     } else {
@@ -1091,32 +1688,85 @@ fn send_request(parts: &[Vec<u8>]) -> io::Result<Vec<u8>> {
     let paths = resolve_paths()?;
     let mut stream = match UnixStream::connect(&paths.socket) {
         Ok(stream) => stream,
-        Err(_) => {
-            start_server(&paths.socket)?;
-            UnixStream::connect(&paths.socket)?
+        Err(error) => {
+            runtime_log(
+                &paths,
+                "DEBUG",
+                &format!(
+                    "event=client_connect_failed error_kind={:?} error=\"{}\" action=start_server",
+                    error.kind(),
+                    json_escape(&error.to_string())
+                ),
+            );
+            start_server(&paths)?;
+            UnixStream::connect(&paths.socket).inspect_err(|retry_error| {
+                runtime_log(
+                    &paths,
+                    "ERROR",
+                    &format!(
+                        "event=client_reconnect_failed error_kind={:?} error=\"{}\"",
+                        retry_error.kind(),
+                        json_escape(&retry_error.to_string())
+                    ),
+                );
+            })?
         }
     };
-    write_packet(&mut stream, parts)?;
+    write_packet(&mut stream, parts).inspect_err(|error| {
+        runtime_log(
+            &paths,
+            "ERROR",
+            &format!(
+                "event=client_write_failed error_kind={:?} error=\"{}\"",
+                error.kind(),
+                json_escape(&error.to_string())
+            ),
+        );
+    })?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    stream.read_to_end(&mut response).inspect_err(|error| {
+        runtime_log(
+            &paths,
+            "ERROR",
+            &format!(
+                "event=client_read_failed error_kind={:?} error=\"{}\"",
+                error.kind(),
+                json_escape(&error.to_string())
+            ),
+        );
+    })?;
     Ok(response)
 }
 
-fn start_server(socket: &Path) -> io::Result<()> {
+fn start_server(paths: &AppPaths) -> io::Result<()> {
     let executable = env::current_exe()?;
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    if cfg!(debug_assertions) {
+        command.env("RUST_BACKTRACE", "full");
+    }
+    let child = command.spawn()?;
+    runtime_log(
+        paths,
+        "DEBUG",
+        &format!("event=server_spawned child_pid={}", child.id()),
+    );
     for _ in 0..40 {
-        if UnixStream::connect(socket).is_ok() {
+        if UnixStream::connect(&paths.socket).is_ok() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
     }
+    runtime_log(
+        paths,
+        "ERROR",
+        "event=server_start_timeout wait_ms=2000 hint=inspect_recent_server_failed_or_panic_event",
+    );
     Err(io::Error::new(
         ErrorKind::TimedOut,
         "vault broker did not become ready",
@@ -1245,6 +1895,9 @@ mod tests {
             field_cache: HashMap::new(),
             settings,
             paths: resolve_paths().unwrap(),
+            started_at: Instant::now(),
+            last_health_log: Instant::now(),
+            next_request_id: 1,
         };
         assert!(!broker.is_expired());
     }
@@ -1255,6 +1908,107 @@ mod tests {
             error_json("bad \"value\""),
             "{\"error\":\"bad \\\"value\\\"\"}"
         );
+    }
+
+    #[test]
+    fn status_reports_the_compiled_build_mode() {
+        let mut broker = Broker {
+            session: None,
+            metadata: Vec::new(),
+            field_cache: HashMap::new(),
+            settings: Settings::default(),
+            paths: resolve_paths().unwrap(),
+            started_at: Instant::now(),
+            last_health_log: Instant::now(),
+            next_request_id: 1,
+        };
+        assert!(
+            broker
+                .status_json()
+                .contains(&format!("\"debug\":{}", cfg!(debug_assertions)))
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_contains_only_aggregate_runtime_state() {
+        let broker = Broker {
+            session: None,
+            metadata: b"[]".to_vec(),
+            field_cache: HashMap::new(),
+            settings: Settings::default(),
+            paths: resolve_paths().unwrap(),
+            started_at: Instant::now(),
+            last_health_log: Instant::now(),
+            next_request_id: 1,
+        };
+        let diagnostics = broker.diagnostics_json();
+        assert!(diagnostics.contains("\"rssKiB\":"));
+        assert!(diagnostics.contains("\"peakRssKiB\":"));
+        assert!(diagnostics.contains("\"cachedFields\":0"));
+        assert!(!diagnostics.contains("BW_SESSION"));
+    }
+
+    #[test]
+    fn bitwarden_operation_names_do_not_include_item_ids() {
+        assert_eq!(
+            safe_bw_operation(&[
+                OsStr::new("get"),
+                OsStr::new("password"),
+                OsStr::new("private-item-id")
+            ]),
+            "get-password"
+        );
+    }
+
+    #[test]
+    fn debug_timestamps_use_iso_8601_utc() {
+        assert_eq!(iso8601_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(iso8601_utc(1_787_572_800), "2026-08-24T12:00:00Z");
+    }
+
+    #[test]
+    fn runtime_log_rotates_at_the_size_limit() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "caelestia-vault-log-test-{}-{unique}",
+            std::process::id()
+        ));
+        let paths = AppPaths {
+            runtime_dir: root.join("runtime"),
+            socket: root.join("runtime/broker.sock"),
+            lock: root.join("runtime/broker.lock"),
+            settings_dir: root.join("settings"),
+            settings: root.join("settings/settings.conf"),
+            state_dir: root.join("state"),
+            debug_log: root.join("state/debug.log"),
+        };
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let log = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&paths.debug_log)
+            .unwrap();
+        log.set_len(DEBUG_LOG_MAX_BYTES).unwrap();
+        drop(log);
+
+        runtime_log(&paths, "DEBUG", "event=rotation_test");
+
+        assert_eq!(
+            fs::metadata(rotated_debug_log(&paths.debug_log, 1))
+                .unwrap()
+                .len(),
+            DEBUG_LOG_MAX_BYTES
+        );
+        assert!(
+            fs::read_to_string(&paths.debug_log)
+                .unwrap()
+                .contains("event=rotation_test")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
