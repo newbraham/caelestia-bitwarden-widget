@@ -9,7 +9,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::ptr::NonNull;
 use std::sync::Once;
 use std::thread;
@@ -22,9 +22,12 @@ const LEGACY_CACHE_KEY_ID: &str = "caelestia-vault-cache";
 const DEFAULT_TIMEOUT_MINUTES: u32 = 15;
 const MAX_TIMEOUT_MINUTES: u32 = 525_600;
 const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(30);
+const IPC_PACKET_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PACKET_PARTS: u32 = 16;
 const MAX_PACKET_PART_SIZE: u32 = 1024 * 1024;
+const MAX_PACKET_SIZE: usize = MAX_PACKET_PARTS as usize * MAX_PACKET_PART_SIZE as usize;
 const HEALTH_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const SECRET_CLEAR_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const DEBUG_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DEBUG_LOG_BACKUPS: usize = 3;
 
@@ -68,6 +71,24 @@ struct LockedSecret {
     address: NonNull<u8>,
     length: usize,
     allocation_length: usize,
+}
+
+struct SensitiveBytes(Vec<u8>);
+
+impl SensitiveBytes {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SensitiveBytes {
+    fn drop(&mut self) {
+        zero_bytes(&mut self.0);
+    }
 }
 
 type FieldCache = HashMap<Vec<u8>, LockedSecret>;
@@ -211,6 +232,8 @@ struct Broker {
     paths: AppPaths,
     started_at: Instant,
     last_health_log: Instant,
+    pending_secret_clear: bool,
+    last_secret_clear_attempt: Instant,
     next_request_id: u64,
 }
 
@@ -611,11 +634,13 @@ fn serve() -> io::Result<()> {
     let mut broker = Broker::new(paths);
     loop {
         broker.maybe_log_health();
+        broker.maybe_retry_secret_clear();
         if broker.is_expired() {
             broker.lock_vault(true);
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
+                stream.set_nonblocking(true)?;
                 let request = read_packet(&mut stream);
                 let (response, shutdown) = match request {
                     Ok(parts) => broker.dispatch(parts),
@@ -640,7 +665,7 @@ fn serve() -> io::Result<()> {
                         (error_json("invalid request").into_bytes(), false)
                     }
                 };
-                let _ = stream.write_all(&response);
+                let _ = write_all_with_timeout(&mut stream, &response, IPC_PACKET_TIMEOUT);
                 if shutdown {
                     break;
                 }
@@ -667,6 +692,8 @@ impl Broker {
             paths,
             started_at: Instant::now(),
             last_health_log: Instant::now(),
+            pending_secret_clear: false,
+            last_secret_clear_attempt: Instant::now(),
             next_request_id: 1,
         };
         broker.remove_legacy_secrets();
@@ -719,24 +746,19 @@ impl Broker {
         let _ = fs::remove_file(self.paths.runtime_dir.join("items.json"));
         let _ = fs::remove_file(self.paths.runtime_dir.join("vault.enc"));
         let _ = fs::remove_file(self.paths.settings_dir.join("settings.json"));
-        secret_clear(LEGACY_SESSION_ID);
-        secret_clear(LEGACY_CACHE_KEY_ID);
+        let _ = secret_clear(LEGACY_SESSION_ID);
+        let _ = secret_clear(LEGACY_CACHE_KEY_ID);
     }
 
     fn restore_persistent_session(&mut self) {
         if !self.settings.persist {
-            secret_clear(SESSION_KEY_ID);
+            self.clear_persistent_session();
             self.settings.last_activity_unix = 0;
             let _ = self.save_settings();
             return;
         }
-        if self.settings.timeout_minutes > 0
-            && (self.settings.last_activity_unix == 0
-                || now_unix()
-                    >= self.settings.last_activity_unix
-                        + i64::from(self.settings.timeout_minutes) * 60)
-        {
-            secret_clear(SESSION_KEY_ID);
+        if persistent_session_must_be_cleared(self.settings, now_unix()) {
+            self.clear_persistent_session();
             self.settings.last_activity_unix = 0;
             let _ = self.save_settings();
             return;
@@ -745,7 +767,7 @@ impl Broker {
             match LockedSecret::new(value) {
                 Ok(session) => self.session = Some(session),
                 Err(_) => {
-                    secret_clear(SESSION_KEY_ID);
+                    self.clear_persistent_session();
                     self.settings.last_activity_unix = 0;
                     let _ = self.save_settings();
                 }
@@ -756,15 +778,42 @@ impl Broker {
         }
     }
 
-    fn dispatch(&mut self, parts: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
+    fn clear_persistent_session(&mut self) {
+        self.last_secret_clear_attempt = Instant::now();
+        match secret_clear(SESSION_KEY_ID) {
+            Ok(()) => self.pending_secret_clear = false,
+            Err(error) => {
+                self.pending_secret_clear = true;
+                runtime_log(
+                    &self.paths,
+                    "WARN",
+                    &format!(
+                        "event=persistent_session_clear_failed error=\"{}\" retry_seconds={}",
+                        json_escape(&error.to_string()),
+                        SECRET_CLEAR_RETRY_INTERVAL.as_secs()
+                    ),
+                );
+            }
+        }
+    }
+
+    fn maybe_retry_secret_clear(&mut self) {
+        if self.pending_secret_clear
+            && self.last_secret_clear_attempt.elapsed() >= SECRET_CLEAR_RETRY_INTERVAL
+        {
+            self.clear_persistent_session();
+        }
+    }
+
+    fn dispatch(&mut self, mut parts: Vec<Vec<u8>>) -> (Vec<u8>, bool) {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         let started = Instant::now();
         let command = parts
             .first()
-            .map(|part| String::from_utf8_lossy(part))
+            .map(|part| String::from_utf8_lossy(part).into_owned())
             .unwrap_or_else(|| "status".into());
-        let logged_command = match command.as_ref() {
+        let logged_command = match command.as_str() {
             "status" | "set-session" | "configure" | "list" | "copy-username" | "copy-password"
             | "copy-totp" | "open-uri" | "sync" | "lock" | "shutdown" | "open-app"
             | "browser-extension" | "diagnostics" => command.as_ref(),
@@ -787,9 +836,9 @@ impl Broker {
                 Ok(self.diagnostics_json().into_bytes())
             }
             "set-session" => parts
-                .get(1)
+                .get_mut(1)
                 .ok_or_else(|| "Bitwarden returned an empty session".to_string())
-                .and_then(|value| self.set_session(value.clone()))
+                .and_then(|value| self.set_session(std::mem::take(value)))
                 .map(|_| ok_json().as_bytes().to_vec()),
             "configure" => self
                 .configure_from_parts(&parts)
@@ -810,7 +859,14 @@ impl Broker {
             "sync" => self.sync_vault().map(|_| ok_json().as_bytes().to_vec()),
             "lock" => {
                 self.lock_vault(false);
-                Ok(ok_json().as_bytes().to_vec())
+                if self.pending_secret_clear {
+                    Err(
+                        "Vault locked, but removal of the persistent Keyring session is still pending"
+                            .into(),
+                    )
+                } else {
+                    Ok(ok_json().as_bytes().to_vec())
+                }
             }
             "shutdown" => {
                 self.lock_vault(false);
@@ -938,15 +994,16 @@ impl Broker {
                     session.as_bytes(),
                 ) {
                     self.settings.persist = false;
-                    secret_clear(SESSION_KEY_ID);
+                    self.clear_persistent_session();
                     let _ = self.save_settings();
                     return Err(format!("could not persist the session: {error}"));
                 }
+                self.pending_secret_clear = false;
             } else {
-                secret_clear(SESSION_KEY_ID);
+                self.clear_persistent_session();
             }
         } else if !persist {
-            secret_clear(SESSION_KEY_ID);
+            self.clear_persistent_session();
         }
         self.save_settings().map_err(|error| error.to_string())
     }
@@ -968,10 +1025,14 @@ impl Broker {
                 session.as_bytes(),
             ) {
                 self.session = None;
+                self.settings.last_activity_unix = 0;
+                self.clear_persistent_session();
+                let _ = self.save_settings();
                 return Err(format!("could not persist the session: {error}"));
             }
+            self.pending_secret_clear = false;
         } else {
-            secret_clear(SESSION_KEY_ID);
+            self.clear_persistent_session();
         }
         self.save_settings().map_err(|error| error.to_string())?;
         runtime_log(
@@ -1150,7 +1211,7 @@ impl Broker {
         self.field_cache.clear();
         self.settings.last_activity_unix = 0;
         let _ = self.save_settings();
-        secret_clear(SESSION_KEY_ID);
+        self.clear_persistent_session();
         let _ = Command::new("bw")
             .arg("lock")
             .stdout(Stdio::null())
@@ -1166,7 +1227,12 @@ impl Broker {
                 "event=vault_locked reason=request"
             },
         );
-        if automatic {
+        if self.pending_secret_clear {
+            notify(
+                "Vault locked",
+                "Keyring cleanup is pending and will be retried automatically.",
+            );
+        } else if automatic {
             notify("Vault locked", "The inactivity timeout expired.");
         } else {
             notify("Vault locked", "");
@@ -1314,6 +1380,12 @@ fn load_settings(path: &Path) -> Settings {
         }
     }
     settings
+}
+
+fn persistent_session_must_be_cleared(settings: Settings, now: i64) -> bool {
+    settings.last_activity_unix == 0
+        || (settings.timeout_minutes > 0
+            && now >= settings.last_activity_unix + i64::from(settings.timeout_minutes) * 60)
 }
 
 fn run_bw_os(session: &LockedSecret, args: &[&OsStr]) -> io::Result<Vec<u8>> {
@@ -1558,12 +1630,39 @@ fn secret_store(id: &str, label: &str, value: &[u8]) -> io::Result<()> {
     }
 }
 
-fn secret_clear(id: &str) {
-    let _ = Command::new("secret-tool")
+fn secret_clear(id: &str) -> io::Result<()> {
+    let started = Instant::now();
+    let output = Command::new("secret-tool")
         .args(["clear", "application", id])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::piped())
+        .output()?;
+    // secret-tool exits with 1 and no stderr when no matching entry exists.
+    // That is already the desired postcondition; real Secret Service errors
+    // are printed to stderr.
+    let success = secret_clear_result_is_safe(&output.status, &output.stderr);
+    process_log(
+        if success { "DEBUG" } else { "WARN" },
+        &format!(
+            "event=external_command program=secret-tool operation=clear result={} {} duration_ms={} stderr_bytes={}",
+            if success { "ok" } else { "error" },
+            exit_status(output.status),
+            started.elapsed().as_millis(),
+            output.stderr.len()
+        ),
+    );
+    if success {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "keyring clear failed ({})",
+            exit_status(output.status)
+        )))
+    }
+}
+
+fn secret_clear_result_is_safe(status: &ExitStatus, stderr: &[u8]) -> bool {
+    status.success() || (status.code() == Some(1) && stderr.is_empty())
 }
 
 fn open_terminal() -> io::Result<()> {
@@ -1637,9 +1736,9 @@ fn unlock_interactive() -> Result<(), String> {
     }
     let locked = LockedSecret::new(session)
         .map_err(|error| format!("could not lock session memory: {error}"))?;
-    let mut request = vec![b"set-session".to_vec(), locked.as_bytes().to_vec()];
+    let request_session = SensitiveBytes::new(locked.as_bytes().to_vec());
+    let request = [b"set-session".as_slice(), request_session.as_bytes()];
     let response = send_request(&request).map_err(|error| error.to_string())?;
-    zero_bytes(&mut request[1]);
     if response.starts_with(b"{\"error\"") {
         return Err(String::from_utf8_lossy(&response).into_owned());
     }
@@ -1684,7 +1783,7 @@ fn clear_clipboard() {
         .status();
 }
 
-fn send_request(parts: &[Vec<u8>]) -> io::Result<Vec<u8>> {
+fn send_request<T: AsRef<[u8]>>(parts: &[T]) -> io::Result<Vec<u8>> {
     let paths = resolve_paths()?;
     let mut stream = match UnixStream::connect(&paths.socket) {
         Ok(stream) => stream,
@@ -1773,11 +1872,12 @@ fn start_server(paths: &AppPaths) -> io::Result<()> {
     ))
 }
 
-fn write_packet(stream: &mut UnixStream, parts: &[Vec<u8>]) -> io::Result<()> {
+fn write_packet<T: AsRef<[u8]>>(stream: &mut UnixStream, parts: &[T]) -> io::Result<()> {
     let count = u32::try_from(parts.len())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "too many request parts"))?;
     stream.write_all(&count.to_be_bytes())?;
     for part in parts {
+        let part = part.as_ref();
         let length = u32::try_from(part.len())
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "request part is too large"))?;
         stream.write_all(&length.to_be_bytes())?;
@@ -1787,30 +1887,103 @@ fn write_packet(stream: &mut UnixStream, parts: &[Vec<u8>]) -> io::Result<()> {
 }
 
 fn read_packet(stream: &mut UnixStream) -> io::Result<Vec<Vec<u8>>> {
-    let count = read_u32(stream)?;
+    read_packet_with_timeout(stream, IPC_PACKET_TIMEOUT)
+}
+
+fn read_packet_with_timeout(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> io::Result<Vec<Vec<u8>>> {
+    let deadline = Instant::now() + timeout;
+    let count = read_u32_with_deadline(stream, deadline)?;
     if count == 0 || count > MAX_PACKET_PARTS {
         return Err(io::Error::new(ErrorKind::InvalidData, "invalid part count"));
     }
     let mut parts = Vec::with_capacity(count as usize);
+    let mut total_size = 0usize;
     for _ in 0..count {
-        let length = read_u32(stream)?;
+        let length = read_u32_with_deadline(stream, deadline)?;
         if length > MAX_PACKET_PART_SIZE {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
                 "request part is too large",
             ));
         }
+        total_size = total_size
+            .checked_add(length as usize)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "request is too large"))?;
+        if total_size > MAX_PACKET_SIZE {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "request is too large",
+            ));
+        }
         let mut part = vec![0; length as usize];
-        stream.read_exact(&mut part)?;
+        read_exact_with_deadline(stream, &mut part, deadline)?;
         parts.push(part);
     }
     Ok(parts)
 }
 
-fn read_u32(reader: &mut impl Read) -> io::Result<u32> {
+fn read_u32_with_deadline(stream: &mut UnixStream, deadline: Instant) -> io::Result<u32> {
     let mut bytes = [0; 4];
-    reader.read_exact(&mut bytes)?;
+    read_exact_with_deadline(stream, &mut bytes, deadline)?;
     Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_exact_with_deadline(
+    stream: &mut UnixStream,
+    mut buffer: &mut [u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !buffer.is_empty() {
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "incomplete request",
+                ));
+            }
+            Ok(read) => buffer = &mut buffer[read..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(ErrorKind::TimedOut, "request timed out"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn write_all_with_timeout(
+    stream: &mut UnixStream,
+    mut buffer: &[u8],
+    timeout: Duration,
+) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    while !buffer.is_empty() {
+        match stream.write(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    ErrorKind::WriteZero,
+                    "could not write response",
+                ));
+            }
+            Ok(written) => buffer = &buffer[written..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(ErrorKind::TimedOut, "response timed out"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn command_exists(name: &str) -> bool {
@@ -1881,6 +2054,7 @@ fn json_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
 
     #[test]
     fn timeout_zero_never_expires() {
@@ -1897,6 +2071,8 @@ mod tests {
             paths: resolve_paths().unwrap(),
             started_at: Instant::now(),
             last_health_log: Instant::now(),
+            pending_secret_clear: false,
+            last_secret_clear_attempt: Instant::now(),
             next_request_id: 1,
         };
         assert!(!broker.is_expired());
@@ -1920,6 +2096,8 @@ mod tests {
             paths: resolve_paths().unwrap(),
             started_at: Instant::now(),
             last_health_log: Instant::now(),
+            pending_secret_clear: false,
+            last_secret_clear_attempt: Instant::now(),
             next_request_id: 1,
         };
         assert!(
@@ -1939,6 +2117,8 @@ mod tests {
             paths: resolve_paths().unwrap(),
             started_at: Instant::now(),
             last_health_log: Instant::now(),
+            pending_secret_clear: false,
+            last_secret_clear_attempt: Instant::now(),
             next_request_id: 1,
         };
         let diagnostics = broker.diagnostics_json();
@@ -2029,5 +2209,43 @@ mod tests {
         assert_eq!(base64_decode(b"c2VjcmV0").unwrap(), b"secret");
         assert_eq!(base64_decode(b"YQ==").unwrap(), b"a");
         assert!(base64_decode(b"invalid").is_err());
+    }
+
+    #[test]
+    fn explicitly_locked_persistent_session_is_never_restored() {
+        let settings = Settings {
+            timeout_minutes: 0,
+            persist: true,
+            last_activity_unix: 0,
+        };
+        assert!(persistent_session_must_be_cleared(settings, now_unix()));
+    }
+
+    #[test]
+    fn active_persistent_session_with_timeout_disabled_is_restored() {
+        let settings = Settings {
+            timeout_minutes: 0,
+            persist: true,
+            last_activity_unix: now_unix(),
+        };
+        assert!(!persistent_session_must_be_cleared(settings, now_unix()));
+    }
+
+    #[test]
+    fn incomplete_ipc_packet_times_out() {
+        let (mut server, _client) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let error = read_packet_with_timeout(&mut server, Duration::from_millis(20)).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn missing_keyring_entry_is_already_clear_but_service_error_is_not() {
+        let not_found = ExitStatus::from_raw(1 << 8);
+        assert!(secret_clear_result_is_safe(&not_found, b""));
+        assert!(!secret_clear_result_is_safe(
+            &not_found,
+            b"Secret Service unavailable"
+        ));
     }
 }
