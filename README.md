@@ -63,8 +63,11 @@ Copied values stay in the clipboard for up to 30 seconds. They are sent through
   current inactivity-timeout period. With timeout `0`, the complete decrypted login cache
   remains in memory until lock or restart.
 - The broker disables core dumps and exposes only a mode `0600` Unix socket.
+- Incomplete socket requests and blocked responses are discarded after two seconds.
 - Locking, timeout, sync, session replacement, or broker restart clears the field cache.
 - Locking the Vault also clears its session, in-memory metadata, and clipboard contents.
+- Failed removals of a persistent Keyring session are reported and retried while the broker
+  is running and again after restart; an explicitly locked session is never restored.
 - Passwords, usernames, and TOTP codes are copied with the sensitive hint, then removed
   from the clipboard after at most 30 seconds.
 
